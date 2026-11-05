@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""
+pvpn - control ProtonVPN from the terminal.
+
+Thin wrapper around the official ``protonvpn`` CLI shipped inside the
+ProtonVPN Flatpak, plus NetworkManager-based status.  Every command supports
+``--json`` for use by scripts and other programs.
+
+Run ``pvpn --help`` for usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+# Allow running via a symlink (e.g. ~/.local/bin/pvpn -> this file).
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import pvpnlib
+
+VERSION = "1.0.0"
+
+
+def _print_json(data: dict) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _make_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+    common.add_argument("--keep-gui", action="store_true",
+                        help="Do NOT close the ProtonVPN GUI before running this command.")
+
+    parser = argparse.ArgumentParser(
+        prog="pvpn",
+        description="Control the ProtonVPN Flatpak from the command line.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  pvpn status\n"
+            "  pvpn connect --country NL\n"
+            "  pvpn connect --city 'New York'\n"
+            "  pvpn connect IT#23\n"
+            "  pvpn disconnect\n"
+            "  pvpn countries list\n"
+            "  pvpn cities US\n"
+            "  pvpn info\n"
+            "  pvpn signin me@proton.me\n"
+            "\n"
+            "The ProtonVPN GUI is closed automatically before commands that need "
+            "it (use --keep-gui to refuse to close it).\n"
+        ),
+    )
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.set_defaults(need_gui_closed=True)
+
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    p = sub.add_parser("status", parents=[common], help="Show current VPN status.")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("connect", parents=[common], help="Connect to a ProtonVPN server (defaults to the Netherlands).")
+    p.add_argument("server", nargs="?", help="Specific server, e.g. IT#23.")
+    p.add_argument("--country", help="Country code (NL, US, GB) or full name. Default: NL.")
+    p.add_argument("--city", help="City name, e.g. 'Amsterdam'.")
+    p.add_argument("--any-country", action="store_true",
+                   help="Ignore the NL default and use Proton's global fastest server.")
+    p.add_argument("--p2p", action="store_true", help="Fastest P2P server.")
+    p.add_argument("--securecore", "-sc", action="store_true", help="Fastest Secure Core server.")
+    p.add_argument("--tor", action="store_true", help="Fastest Tor server.")
+    p.add_argument("--random", action="store_true", help="Random server.")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("disconnect", parents=[common], help="Disconnect from the VPN.")
+    p.set_defaults(func=cmd_disconnect)
+
+    p = sub.add_parser("info", parents=[common], help="Show account information.")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("signin", help="Sign in (interactive password + 2FA prompt).")
+    p.add_argument("username")
+    p.set_defaults(func=cmd_signin)
+
+    p = sub.add_parser("signout", parents=[common], help="Sign out and clear credentials.")
+    p.set_defaults(func=cmd_signout)
+
+    p = sub.add_parser("servers", parents=[common], help="Link to the full server list.")
+    p.set_defaults(func=cmd_servers)
+
+    p = sub.add_parser("countries", parents=[common], help="List available countries.")
+    p.add_argument("cmd", nargs="?", default="list", choices=["list"],
+                   help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_countries)
+
+    p = sub.add_parser("cities", parents=[common], help="List cities in a country.")
+    p.add_argument("country")
+    p.add_argument("cmd", nargs="?", default="list", choices=["list"],
+                   help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_cities)
+
+    p = sub.add_parser("config", parents=[common],
+                       help="Pass arguments to the official 'config' command.")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("raw", help="Do not use. Escape hatch to the official CLI.")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_raw)
+
+    return parser
+
+
+def _gui_note(close_gui: bool) -> None:
+    if close_gui and pvpnlib.gui_running():
+        print("Note: closing the ProtonVPN GUI so the CLI can run.", file=sys.stderr)
+        pvpnlib.close_gui()
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    data = pvpnlib.status()
+    if args.json:
+        _print_json(data)
+        return
+    if data["connected"]:
+        print(f"Status: Connected")
+        print(f"Server: {data['server']}")
+        print(f"Profile: {data['connection']}")
+        print(f"Interface: {data['device']}")
+        if data["ipv4"]:
+            print(f"IP: {data['ipv4']}")
+    else:
+        print("Status: Disconnected")
+
+
+def cmd_connect(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    try:
+        data = pvpnlib.connect(
+            server=args.server,
+            country=args.country,
+            city=args.city,
+            p2p=args.p2p,
+            securecore=args.securecore,
+            tor=args.tor,
+            random=args.random,
+            default_country=None if args.any_country else pvpnlib.DEFAULT_COUNTRY,
+            close_gui_if_needed=close_gui,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        _print_json(data)
+    else:
+        print(data["output"])
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_disconnect(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    if not args.json:
+        print("Warning: disconnecting may cut network access if you are connected "
+              "to this machine through the VPN.", file=sys.stderr)
+    try:
+        data = pvpnlib.disconnect(close_gui_if_needed=close_gui)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        _print_json(data)
+    else:
+        print(data["output"])
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.info(close_gui_if_needed=close_gui)
+    if args.json:
+        _print_json(data)
+    elif data["signed_in"]:
+        print(f"Account: '{data['account']}'")
+    else:
+        print(data["output"] or "Not signed in.")
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_signin(args: argparse.Namespace) -> None:
+    _gui_note(True)
+    rc = pvpnlib.signin_interactive(args.username)
+    sys.exit(rc)
+
+
+def cmd_signout(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.signout()
+    if args.json:
+        _print_json(data)
+    else:
+        print(data["output"])
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_servers(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.servers(close_gui_if_needed=close_gui)
+    if args.json:
+        _print_json(data)
+    else:
+        print(data["output"])
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_countries(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.countries()
+    if args.json:
+        _print_json(data)
+    else:
+        for c in data["countries"]:
+            print(f"{c['code'].upper():<5} {c['name']}")
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_cities(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.cities(args.country)
+    if args.json:
+        _print_json(data)
+    else:
+        print(f"Cities in {data['country']}:")
+        for c in data["cities"]:
+            feats = ", ".join(c["features"])
+            print(f"  {c['name']:<20} {feats}")
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    close_gui = not args.keep_gui
+    _gui_note(close_gui)
+    data = pvpnlib.config(args.args)
+    if args.json:
+        _print_json(data)
+    else:
+        print(data["output"])
+    sys.exit(0 if data["ok"] else 1)
+
+
+def cmd_raw(args: argparse.Namespace) -> None:
+    proc = pvpnlib.raw(list(args.args), capture=False, close_gui_if_needed=True)
+    sys.exit(proc.returncode)
+
+
+def main(argv=None) -> int:
+    parser = _make_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    try:
+        args.func(args)
+        return 0
+    except KeyboardInterrupt:
+        print("Aborted.", file=sys.stderr)
+        return 130
+    except pvpnlib.PvpnError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
